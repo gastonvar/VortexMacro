@@ -1,0 +1,14 @@
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\bin\Debug\net8.0\AutoClicker.exe
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\bin\Debug\net8.0\AutoClicker.deps.json
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\bin\Debug\net8.0\AutoClicker.runtimeconfig.json
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\bin\Debug\net8.0\AutoClicker.dll
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\bin\Debug\net8.0\AutoClicker.pdb
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\AutoClicker.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\AutoClicker.AssemblyInfoInputs.cache
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\AutoClicker.AssemblyInfo.cs
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\AutoClicker.csproj.CoreCompileInputs.cache
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\AutoClicker.dll
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\refint\AutoClicker.dll
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\AutoClicker.pdb
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\AutoClicker.genruntimeconfig.cache
+C:\Users\gasva\Desktop\AutoClicker\AutoClicker\AutoClicker\obj\Debug\net8.0\ref\AutoClicker.dll
