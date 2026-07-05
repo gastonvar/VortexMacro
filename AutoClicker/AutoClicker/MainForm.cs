@@ -1,4 +1,4 @@
-using System.Reflection;
+using AutoClicker.Controls;
 
 namespace AutoClicker;
 
@@ -6,78 +6,72 @@ internal enum AppView
 {
     Vortex,
     AutoClicker,
-    Recorder
+    Recorder,
+    Piano,
+    Settings
 }
 
 internal sealed class MainForm : Form
 {
     private readonly MacroEngine _engine = new();
     private readonly MacroRecorderService _recorder = new();
-    private readonly string _settingsPath = Path.Combine(AppContext.BaseDirectory, "app-settings.json");
-    private readonly Dictionary<string, NumericUpDown> _vortexSettingInputs = new();
+    private readonly MacroSession _session = new();
+    private readonly MacroLibrary _macroLibrary = new();
+    private readonly CoordinatePickerService _coordinatePicker = new();
+    private readonly HotkeyButtonTracker _hotkeyButtons = new();
+    private readonly string _settingsPath = SettingsPaths.PrepareSettingsFile();
     private readonly Dictionary<AppView, Button> _navButtons = new();
-    private readonly Dictionary<AppView, Panel> _views = new();
-    private readonly Dictionary<Button, string> _buttonBaseLabels = new();
-    private readonly Dictionary<Button, Func<HotkeyChord>> _buttonHotkeyProviders = new();
+    private readonly Dictionary<AppView, Control> _views = new();
     private readonly System.Windows.Forms.Timer _mouseTimer = new();
 
     private GlobalHotkeyService? _hotkeyService;
-    private AppSettings _settings;
+    private TrayIconService? _tray;
+    private MacroOverlayForm? _overlay;
+    private AppSettings _settings = AppSettings.CreateDefault();
+    private bool _uiReady;
     private AppView _currentView = AppView.Vortex;
     private Panel _contentPanel = null!;
     private TextBox _logBox = null!;
     private Label _mousePositionLabel = null!;
-    private ListBox _recordedEventsList = null!;
-
-    private NumericUpDown _autoIntervalInput = null!;
-    private NumericUpDown _autoClicksInput = null!;
-    private NumericUpDown _autoStartDelayInput = null!;
-    private ComboBox _autoClickTypeInput = null!;
-    private TextBox _startHotkeyInput = null!;
-    private TextBox _stopHotkeyInput = null!;
-    private TextBox _playHotkeyInput = null!;
-    private TextBox _macroNameInput = null!;
-
-    private Button _vortexStartButton = null!;
-    private Button _vortexPauseButton = null!;
-    private Button _vortexStopButton = null!;
-    private Button _vortexSaveButton = null!;
-    private Button _vortexResetButton = null!;
-    private Button _autoStartButton = null!;
-    private Button _autoStopButton = null!;
-    private Button _autoSaveButton = null!;
-    private Button _recordToggleButton = null!;
-    private Button _recordPlayButton = null!;
-    private Button _recordStopButton = null!;
-    private Button _recordImportButton = null!;
-    private Button _recordExportButton = null!;
-    private Button _recordClearButton = null!;
-    private Button _saveHotkeysButton = null!;
+    private HotkeyPanel _hotkeyPanel = null!;
+    private VortexView _vortexView = null!;
+    private AutoClickerView _autoClickerView = null!;
+    private RecorderView _recorderView = null!;
+    private PianoPlayerView _pianoView = null!;
+    private SettingsView _settingsView = null!;
 
     private CancellationTokenSource? _vortexCts;
     private CancellationTokenSource? _autoClickerCts;
     private CancellationTokenSource? _playbackCts;
-    private TextBox? _activeHotkeyCapture;
+    private CancellationTokenSource? _pianoCts;
+    private bool _isPickingCoordinate;
+    private bool _reallyExit;
 
     public MainForm()
     {
-        _settings = AppSettings.Load(_settingsPath);
-
         Text = "Gasvar Macro";
         StartPosition = FormStartPosition.CenterScreen;
-        Width = 820;
-        Height = 720;
-        MinimumSize = new Size(680, 560);
+        Width = 860;
+        Height = 740;
+        MinimumSize = new Size(700, 580);
         UiTheme.ApplyForm(this);
 
         BuildUi();
-        LoadSettingsIntoInputs();
+
+        _settings = AppSettings.Load(_settingsPath, AppendLog);
+        AppendLog($"Settings loaded from: {_settingsPath}");
+
+        WireEvents();
+        LoadAllSettings();
         ShowView(AppView.Vortex);
 
         _engine.StatusChanged += (_, message) => AppendLog(message);
         _engine.MousePositionChanged += (_, position) => SetMousePosition(position);
+        _engine.SessionStarted += OnSessionStarted;
+        _engine.SessionEnded += OnSessionEnded;
         _recorder.StatusChanged += (_, message) => AppendLog(message);
-        _recorder.EventsChanged += (_, _) => RefreshRecordedEventsList();
+        _recorder.EventsChanged += (_, _) => _recorderView.RefreshEvents(_recorder.Events);
+        _recorder.Configure(_settings.Recorder);
 
         _mouseTimer.Interval = 100;
         _mouseTimer.Tick += (_, _) => SetMousePosition(MacroEngine.GetCurrentMousePositionText());
@@ -87,17 +81,45 @@ internal sealed class MainForm : Form
         {
             _hotkeyService = new GlobalHotkeyService(Handle);
             RegisterHotkeys();
+            ApplyBehaviorSettings();
         };
+
+        _uiReady = true;
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (!_reallyExit && _settings.Behavior.CloseToTray && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            HideToTray();
+            return;
+        }
+
+        SaveSettings();
         _vortexCts?.Cancel();
         _autoClickerCts?.Cancel();
         _playbackCts?.Cancel();
+        _pianoCts?.Cancel();
         _hotkeyService?.Dispose();
+        _tray?.Dispose();
+        _overlay?.Close();
+        _overlay?.Dispose();
+        _coordinatePicker.Dispose();
         _recorder.Dispose();
+        _session.Dispose();
         base.OnFormClosing(e);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (!_uiReady || !_settings.Behavior.MinimizeToTray || WindowState != FormWindowState.Minimized)
+        {
+            return;
+        }
+
+        HideToTray();
     }
 
     protected override void WndProc(ref Message m)
@@ -122,13 +144,7 @@ internal sealed class MainForm : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 155));
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
-        var sidebar = new Panel
-        {
-            Dock = DockStyle.Fill,
-            BackColor = UiTheme.Sidebar,
-            Padding = new Padding(0, 20, 0, 20)
-        };
-
+        var sidebar = new Panel { Dock = DockStyle.Fill, BackColor = UiTheme.Sidebar, Padding = new Padding(0, 20, 0, 20) };
         var brand = new Label
         {
             Text = "GASVAR\nMACRO",
@@ -150,56 +166,124 @@ internal sealed class MainForm : Form
         };
 
         var navStack = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 6, 0, 0) };
-        Button recorderButton = CreateNavButton("Recorder", AppView.Recorder, () => _settings.Hotkeys.NavRecorder);
-        Button autoButton = CreateNavButton("AutoClicker", AppView.AutoClicker, () => _settings.Hotkeys.NavAutoClicker);
-        Button vortexButton = CreateNavButton("Vortex Nexus", AppView.Vortex, () => _settings.Hotkeys.NavVortex);
-
-        navStack.Controls.Add(recorderButton);
-        navStack.Controls.Add(autoButton);
-        navStack.Controls.Add(vortexButton);
-
-        _navButtons[AppView.Vortex] = vortexButton;
-        _navButtons[AppView.AutoClicker] = autoButton;
-        _navButtons[AppView.Recorder] = recorderButton;
+        Button vortexNav = CreateNavButton("Vortex Nexus", AppView.Vortex, HotkeyRestrictions.NavVortex);
+        Button autoNav = CreateNavButton("AutoClicker", AppView.AutoClicker, HotkeyRestrictions.NavAutoClicker);
+        Button recorderNav = CreateNavButton("Recorder", AppView.Recorder, HotkeyRestrictions.NavRecorder);
+        Button pianoNav = CreateNavButton("Piano Player", AppView.Piano, HotkeyRestrictions.NavPiano);
+        Button settingsNav = CreateNavButton("Settings", AppView.Settings, null);
+        navStack.Controls.AddRange([settingsNav, pianoNav, recorderNav, autoNav, vortexNav]);
+        _navButtons[AppView.Vortex] = vortexNav;
+        _navButtons[AppView.AutoClicker] = autoNav;
+        _navButtons[AppView.Recorder] = recorderNav;
+        _navButtons[AppView.Piano] = pianoNav;
+        _navButtons[AppView.Settings] = settingsNav;
 
         sidebar.Controls.Add(navStack);
         sidebar.Controls.Add(_mousePositionLabel);
         sidebar.Controls.Add(brand);
 
         var main = new Panel { Dock = DockStyle.Fill, Padding = new Padding(12), BackColor = UiTheme.Background };
-
-        var headerHotkeys = CreateHeaderHotkeysPanel();
-
+        _hotkeyPanel = new HotkeyPanel();
         _contentPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(0, 8, 0, 8) };
         _logBox = UiTheme.CreateLogBox();
-
-        var logCard = new Panel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 140,
-            BackColor = UiTheme.Surface,
-            Padding = new Padding(12)
-        };
+        var logCard = new Panel { Dock = DockStyle.Bottom, Height = 140, BackColor = UiTheme.Surface, Padding = new Padding(12) };
         logCard.Controls.Add(_logBox);
 
-        _views[AppView.Vortex] = CreateVortexView();
-        _views[AppView.AutoClicker] = CreateAutoClickerView();
-        _views[AppView.Recorder] = CreateRecorderView();
+        _vortexView = new VortexView();
+        _autoClickerView = new AutoClickerView();
+        _recorderView = new RecorderView();
+        _pianoView = new PianoPlayerView();
+        _settingsView = new SettingsView();
+        _views[AppView.Vortex] = _vortexView;
+        _views[AppView.AutoClicker] = _autoClickerView;
+        _views[AppView.Recorder] = _recorderView;
+        _views[AppView.Piano] = _pianoView;
+        _views[AppView.Settings] = _settingsView;
 
         main.Controls.Add(_contentPanel);
         main.Controls.Add(logCard);
-        main.Controls.Add(headerHotkeys);
-
+        main.Controls.Add(_hotkeyPanel);
         root.Controls.Add(sidebar, 0, 0);
         root.Controls.Add(main, 1, 0);
         Controls.Add(root);
+
+        TrackViewButtons();
     }
 
-    private Button CreateNavButton(string text, AppView view, Func<HotkeyChord> hotkeyProvider)
+    private void TrackViewButtons()
     {
-        Button button = UiTheme.CreateNavButton(FormatNavButtonLabel(text, hotkeyProvider()), (_, _) => ShowView(view));
+        _hotkeyButtons.Track(_vortexView.StartButton, "Start", () => _settings.Hotkeys.Start);
+        _hotkeyButtons.Track(_vortexView.PauseButton, "Pause / Resume", () => HotkeyChord.FromKey((Keys)_settings.Vortex.ToggleHotkeyVirtualKey));
+        _hotkeyButtons.Track(_vortexView.StopButton, "Stop", () => _settings.Hotkeys.Stop);
+        _hotkeyButtons.Track(_autoClickerView.StartButton, "Start Autoclicker", () => _settings.Hotkeys.Start);
+        _hotkeyButtons.Track(_autoClickerView.StopButton, "Stop", () => _settings.Hotkeys.Stop);
+        _hotkeyButtons.Track(_recorderView.RecordToggleButton, "Start Recording", () => _settings.Hotkeys.Start);
+        _hotkeyButtons.Track(_recorderView.PlayButton, "Play Macro", () => _settings.Hotkeys.Play);
+        _hotkeyButtons.Track(_recorderView.StopButton, "Stop Playback", () => _settings.Hotkeys.Stop);
+
+        _hotkeyButtons.Track(_pianoView.PlayButton, "Play Song", () => _settings.Hotkeys.Start);
+        _hotkeyButtons.Track(_pianoView.StopButton, "Stop Song", () => _settings.Hotkeys.Stop);
+
+        foreach ((AppView view, Button button) in _navButtons)
+        {
+            if (view == AppView.Settings)
+            {
+                continue;
+            }
+
+            Func<HotkeyChord> provider = view switch
+            {
+                AppView.Vortex => () => HotkeyRestrictions.NavVortex,
+                AppView.AutoClicker => () => HotkeyRestrictions.NavAutoClicker,
+                AppView.Piano => () => HotkeyRestrictions.NavPiano,
+                _ => () => HotkeyRestrictions.NavRecorder
+            };
+            _hotkeyButtons.Track(button, button.Text.Split('\n')[0], provider, isNav: true);
+        }
+    }
+
+    private void WireEvents()
+    {
+        _hotkeyPanel.SaveRequested += (_, _) => SaveSettings();
+        _vortexView.StartRequested += (_, _) => _ = RunSafe(StartVortexAsync);
+        _vortexView.StopRequested += (_, _) => StopVortex();
+        _vortexView.PauseRequested += (_, _) => _engine.TogglePause();
+        _vortexView.SaveRequested += (_, _) => SaveSettings();
+        _vortexView.ResetRequested += (_, _) => ResetVortexDefaults();
+        _vortexView.ProfileChanged += (_, name) => SwitchVortexProfile(name);
+        _vortexView.LogMessage += (_, msg) => AppendLog(msg);
+        _vortexView.CoordinatePickRequested += (_, _) => _ = RunSafe(PickCoordinateAsync);
+
+        _autoClickerView.StartRequested += (_, _) => _ = RunSafe(StartAutoClickerAsync);
+        _autoClickerView.StopRequested += (_, _) => StopAutoClicker();
+        _autoClickerView.SaveRequested += (_, _) => SaveSettings();
+
+        _recorderView.ToggleRecordingRequested += (_, _) => ToggleRecording();
+        _recorderView.PlayRequested += (_, _) => _ = RunSafe(PlayRecordedMacroAsync);
+        _recorderView.StopRequested += (_, _) => StopPlayback();
+        _recorderView.ImportRequested += (_, _) => ImportMacro();
+        _recorderView.ExportRequested += (_, _) => ExportMacro();
+        _recorderView.ClearRequested += (_, _) => _recorder.Clear();
+        _recorderView.SaveToLibraryRequested += (_, _) => SaveMacroToLibrary();
+        _recorderView.LoadFromLibraryRequested += (_, _) => LoadMacroFromLibrary();
+        _recorderView.DeleteFromLibraryRequested += (_, _) => DeleteMacroFromLibrary();
+        _recorderView.RemoveEventRequested += (_, index) => _recorder.RemoveEventAt(index);
+
+        _pianoView.PlayRequested += (_, _) => _ = RunSafe(StartPianoAsync);
+        _pianoView.StopRequested += (_, _) => StopPiano();
+        _pianoView.SaveRequested += (_, _) => SaveSettings();
+        _pianoView.StatusChanged += (_, msg) => AppendLog(msg);
+
+        _settingsView.SaveRequested += (_, _) => SaveSettings();
+        _settingsView.ExportAllRequested += (_, _) => ExportAllSettings();
+        _settingsView.ImportAllRequested += (_, _) => ImportAllSettings();
+    }
+
+    private Button CreateNavButton(string text, AppView view, HotkeyChord? hotkey)
+    {
+        string label = hotkey is { IsValid: true } chord ? $"{text}\n{HotkeyFormatting.Format(chord)}" : text;
+        Button button = UiTheme.CreateNavButton(label, (_, _) => ShowView(view));
         button.Dock = DockStyle.Top;
-        TrackButtonHotkey(button, text, hotkeyProvider);
         return button;
     }
 
@@ -208,411 +292,81 @@ internal sealed class MainForm : Form
         _currentView = view;
         _contentPanel.Controls.Clear();
         _contentPanel.Controls.Add(_views[view]);
-
         foreach ((AppView key, Button button) in _navButtons)
         {
             UiTheme.SetNavActive(button, key == view);
         }
-
     }
 
-    private Panel CreateHeaderHotkeysPanel()
+    private void LoadAllSettings()
     {
-        var panel = new Panel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            BackColor = UiTheme.Background,
-            Padding = new Padding(0, 0, 0, 6)
-        };
-
-        var hotkeys = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            WrapContents = true,
-            Padding = new Padding(0, 4, 0, 0)
-        };
-        hotkeys.Controls.Add(CreateHotkeyField("Start hotkey", out _startHotkeyInput, _settings.Hotkeys.Start));
-        hotkeys.Controls.Add(CreateHotkeyField("Stop hotkey", out _stopHotkeyInput, _settings.Hotkeys.Stop));
-        hotkeys.Controls.Add(CreateHotkeyField("Play hotkey", out _playHotkeyInput, _settings.Hotkeys.Play));
-
-        var saveHotkeysRow = new FlowLayoutPanel
-        {
-            FlowDirection = FlowDirection.TopDown,
-            AutoSize = true,
-            WrapContents = false,
-            Margin = new Padding(4, 0, 0, 0)
-        };
-        var saveHotkeysSpacer = CreateHotkeyLabel("\u00a0");
-        saveHotkeysSpacer.Margin = new Padding(0, 0, 0, 2);
-        _saveHotkeysButton = CreateActionButton("Save Hotkeys", UiTheme.Accent, () => _settings.Hotkeys.Save, SaveSettings);
-        saveHotkeysRow.Controls.Add(saveHotkeysSpacer);
-        saveHotkeysRow.Controls.Add(_saveHotkeysButton);
-        hotkeys.Controls.Add(saveHotkeysRow);
-
-        panel.Controls.Add(hotkeys);
-        return panel;
+        _vortexView.LoadSettings(_settings.Vortex);
+        _vortexView.LoadProfiles(_settings.VortexProfiles.Select(p => p.Name), _settings.ActiveVortexProfile);
+        _autoClickerView.LoadSettings(_settings.AutoClicker);
+        _recorderView.LoadSettings(_settings.Recorder);
+        _pianoView.LoadSettings(_settings.Piano);
+        _settingsView.LoadSettings(_settings.Behavior, _settings.Recorder);
+        _settingsView.SetSettingsPath(_settingsPath);
+        _hotkeyPanel.LoadHotkeys(_settings.Hotkeys);
+        _recorderView.RefreshLibrary(_macroLibrary.ListMacroNames());
+        _recorderView.RefreshEvents(_recorder.Events);
     }
 
-    private FlowLayoutPanel CreateHotkeyField(string label, out TextBox box, HotkeyChord chord)
+    private void ApplySettingsFromInputs()
     {
-        var field = new FlowLayoutPanel
-        {
-            FlowDirection = FlowDirection.TopDown,
-            AutoSize = true,
-            WrapContents = false,
-            Margin = new Padding(0, 0, 10, 0)
-        };
-
-        var fieldLabel = CreateHotkeyLabel(label);
-        fieldLabel.Margin = new Padding(0, 0, 0, 2);
-        box = CreateHotkeyBox(chord);
-        field.Controls.Add(fieldLabel);
-        field.Controls.Add(box);
-        return field;
+        _vortexView.ApplyTo(_settings.Vortex);
+        _autoClickerView.ApplyTo(_settings.AutoClicker);
+        _recorderView.ApplyTo(_settings.Recorder);
+        _pianoView.ApplyTo(_settings.Piano);
+        _settingsView.ApplyTo(_settings.Behavior, _settings.Recorder);
+        _hotkeyPanel.ApplyTo(_settings.Hotkeys);
+        _settings.SaveActiveProfile();
+        _recorder.Configure(_settings.Recorder);
     }
 
-    private Panel CreateVortexView()
+    private void SaveSettings()
     {
-        var card = UiTheme.CreateCard();
-        var layout = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
-            RowCount = 2
-        };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-        var left = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 2,
-            AutoSize = true
-        };
-        left.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        left.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
-        var headerStack = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.TopDown,
-            AutoSize = true,
-            WrapContents = false
-        };
-        headerStack.Controls.Add(UiTheme.CreateTitle("Vortex Nexus"));
-        headerStack.Controls.Add(UiTheme.CreateSubtitle("Configura and run the Vortex Nexus Macro."));
-
-        var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
-        _vortexStartButton = CreateActionButton("Start", UiTheme.Success, () => _settings.Hotkeys.Start, StartVortex);
-        _vortexPauseButton = CreateActionButton("Pause / Resume", UiTheme.Accent, () => HotkeyChord.FromKey((Keys)_settings.Vortex.ToggleHotkeyVirtualKey), () => _engine.TogglePause());
-        _vortexStopButton = CreateActionButton("Stop", UiTheme.Danger, () => _settings.Hotkeys.Stop, StopVortex);
-        _vortexPauseButton.Enabled = false;
-        _vortexStopButton.Enabled = false;
-        actions.Controls.AddRange(new Control[] { _vortexStartButton, _vortexPauseButton, _vortexStopButton });
-
-        left.Controls.Add(headerStack, 0, 0);
-        left.Controls.Add(actions, 0, 1);
-
-        var configScroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = UiTheme.Surface };
-        configScroll.Controls.Add(CreateVortexConfigTable());
-
-        var saveRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true };
-        _vortexSaveButton = CreateActionButton("Save", UiTheme.Accent, () => _settings.Hotkeys.Save, SaveSettings);
-        _vortexResetButton = CreateActionButton("Reset Defaults", UiTheme.SurfaceAlt, () => _settings.Hotkeys.Reset, ResetVortexDefaults);
-        saveRow.Controls.Add(_vortexSaveButton);
-        saveRow.Controls.Add(_vortexResetButton);
-
-        layout.Controls.Add(left, 0, 0);
-        layout.SetColumnSpan(left, 2);
-        layout.Controls.Add(configScroll, 0, 1);
-        layout.Controls.Add(saveRow, 1, 1);
-
-        card.Controls.Add(layout);
-        return card;
+        ApplySettingsFromInputs();
+        _settings.Save(_settingsPath);
+        RegisterHotkeys();
+        ApplyBehaviorSettings();
+        AppendLog("Settings saved.");
     }
 
-    private TableLayoutPanel CreateVortexConfigTable()
+    private void ApplyBehaviorSettings()
     {
-        var table = new TableLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            ColumnCount = 2,
-            BackColor = UiTheme.Surface
-        };
-        table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
-        table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-        int row = 0;
-        AddSection(table, ref row, "Timing");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.CycleDelayMs), "Cycle delay (ms)", 0, 600000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.MoveDelayMs), "Move delay (ms)", 0, 600000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.VortexDelayMs), "After Vortex click (ms)", 0, 600000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusAfterFirstClickDelayMs), "After Nexus click 1 (ms)", 0, 600000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusAfterSecondClickDelayMs), "After Nexus click 2 (ms)", 0, 600000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusDelayMs), "After Nexus click 3 (ms)", 0, 600000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.ClearGoogleDelayMs), "Clear Google delay (ms)", 0, 600000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.ClearGoogleEveryCycles), "Clear Google every cycles", 0, 100000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.ScrollDownSteps), "Scroll down steps", 0, 100000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.ScrollUpSteps), "Scroll up steps", 0, 100000);
-        AddVortexSetting(table, ref row, nameof(MacroSettings.ToggleHotkeyVirtualKey), "Pause hotkey (VK code)", 0, 255);
-
-        AddSection(table, ref row, "Vortex Area");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.VortexXStart), "Vortex X start");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.VortexXEnd), "Vortex X end");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.VortexYStart), "Vortex Y start");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.VortexYEnd), "Vortex Y end");
-
-        AddSection(table, ref row, "Nexus Areas");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusXStart), "Nexus X start");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusXEnd), "Nexus X end");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusYStart), "Nexus Y start");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusYEnd), "Nexus Y end");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusLowerYStart), "Nexus lower Y start");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusLowerYEnd), "Nexus lower Y end");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusLowerPlusYStart), "Nexus lower+ Y start");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusLowerPlusYEnd), "Nexus lower+ Y end");
-
-        AddSection(table, ref row, "Single Clicks");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.CloseNexusReminderX), "Close Nexus reminder X");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.CloseNexusReminderY), "Close Nexus reminder Y");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusPageX), "Nexus page X");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.NexusPageY), "Nexus page Y");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.CloseGoogleX), "Close Google X");
-        AddVortexSetting(table, ref row, nameof(MacroSettings.CloseGoogleY), "Close Google Y");
-
-        return table;
+        StartupService.SetEnabled(_settings.Behavior.StartWithWindows);
     }
 
-    private Panel CreateAutoClickerView()
+    private void SwitchVortexProfile(string name)
     {
-        var card = UiTheme.CreateCard();
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3 };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-        layout.Controls.Add(UiTheme.CreateTitle("AutoClicker"), 0, 0);
-        layout.SetColumnSpan(layout.GetControlFromPosition(0, 0)!, 2);
-        layout.Controls.Add(UiTheme.CreateSubtitle("Repeats clicks at the current cursor position after a short countdown."), 0, 1);
-        layout.SetColumnSpan(layout.GetControlFromPosition(0, 1)!, 2);
-
-        var config = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2 };
-        config.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
-        config.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-        _autoIntervalInput = UiTheme.CreateNumericInput(1, 600000, _settings.AutoClicker.IntervalMs);
-        _autoClicksInput = UiTheme.CreateNumericInput(1, 100000, _settings.AutoClicker.ClickCount);
-        _autoStartDelayInput = UiTheme.CreateNumericInput(0, 600000, _settings.AutoClicker.StartDelayMs);
-        _autoClickTypeInput = UiTheme.CreateComboBox();
-        _autoClickTypeInput.Items.AddRange(new object[] { "Left", "Right" });
-        _autoClickTypeInput.SelectedItem = _settings.AutoClicker.ClickType;
-
-        AddConfigRow(config, 0, "Interval (ms)", _autoIntervalInput);
-        AddConfigRow(config, 1, "Number of clicks", _autoClicksInput);
-        AddConfigRow(config, 2, "Start delay (ms)", _autoStartDelayInput);
-        AddConfigRow(config, 3, "Click type", _autoClickTypeInput);
-
-        var actions = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 12, 0, 0) };
-        _autoStartButton = CreateActionButton("Start Autoclicker", UiTheme.Success, () => _settings.Hotkeys.Start, StartAutoClicker);
-        _autoStopButton = CreateActionButton("Stop", UiTheme.Danger, () => _settings.Hotkeys.Stop, StopAutoClicker);
-        _autoSaveButton = CreateActionButton("Save", UiTheme.Accent, () => _settings.Hotkeys.Save, SaveSettings);
-        _autoStopButton.Enabled = false;
-        actions.Controls.AddRange(new Control[] { _autoStartButton, _autoStopButton, _autoSaveButton });
-
-        var stack = new Panel { Dock = DockStyle.Fill };
-        stack.Controls.Add(actions);
-        stack.Controls.Add(config);
-
-        layout.Controls.Add(stack, 0, 2);
-        layout.SetColumnSpan(stack, 2);
-        card.Controls.Add(layout);
-        return card;
+        ApplySettingsFromInputs();
+        _settings.ActiveVortexProfile = name;
+        _settings.ApplyActiveProfile();
+        _vortexView.LoadSettings(_settings.Vortex);
+        AppendLog($"Switched to profile \"{name}\".");
     }
 
-    private Panel CreateRecorderView()
+    private void ResetVortexDefaults()
     {
-        var card = UiTheme.CreateCard();
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3 };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-        layout.Controls.Add(UiTheme.CreateTitle("Macro Recorder"), 0, 0);
-        layout.SetColumnSpan(layout.GetControlFromPosition(0, 0)!, 2);
-        layout.Controls.Add(UiTheme.CreateSubtitle("Records delays between mouse moves, clicks, scrolls, and keystrokes. Import and export as JSON."), 0, 1);
-        layout.SetColumnSpan(layout.GetControlFromPosition(0, 1)!, 2);
-
-        var left = new Panel { Dock = DockStyle.Fill };
-        _macroNameInput = new TextBox
-        {
-            Text = "My Macro",
-            Width = 220,
-            BackColor = UiTheme.SurfaceAlt,
-            ForeColor = UiTheme.Text,
-            BorderStyle = BorderStyle.FixedSingle
-        };
-
-        var nameRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-        nameRow.Controls.Add(UiTheme.CreateFieldLabel("Macro name"));
-        nameRow.Controls.Add(_macroNameInput);
-
-        var actions = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = true, Padding = new Padding(0, 10, 0, 0) };
-        _recordToggleButton = CreateActionButton("Start Recording", UiTheme.Danger, () => _settings.Hotkeys.Start, ToggleRecording);
-        _recordPlayButton = CreateActionButton("Play Macro", UiTheme.Success, () => _settings.Hotkeys.Play, PlayRecordedMacro);
-        _recordStopButton = CreateActionButton("Stop Playback", UiTheme.Accent, () => _settings.Hotkeys.Stop, StopPlayback);
-        _recordImportButton = CreateActionButton("Import", UiTheme.SurfaceAlt, () => _settings.Hotkeys.Import, ImportMacro);
-        _recordExportButton = CreateActionButton("Export", UiTheme.SurfaceAlt, () => _settings.Hotkeys.Export, ExportMacro);
-        _recordClearButton = CreateActionButton("Clear", UiTheme.SurfaceAlt, () => _settings.Hotkeys.Reset, () => _recorder.Clear());
-        actions.Controls.AddRange(new Control[]
-        {
-            _recordToggleButton,
-            _recordPlayButton,
-            _recordStopButton,
-            _recordImportButton,
-            _recordExportButton,
-            _recordClearButton
-        });
-
-        left.Controls.Add(actions);
-        left.Controls.Add(nameRow);
-
-        _recordedEventsList = UiTheme.CreateEventList();
-        var right = new Panel { Dock = DockStyle.Fill, BackColor = UiTheme.SurfaceAlt, Padding = new Padding(10) };
-        right.Controls.Add(_recordedEventsList);
-
-        layout.Controls.Add(left, 0, 2);
-        layout.Controls.Add(right, 1, 2);
-        card.Controls.Add(layout);
-        return card;
+        _settings.Vortex = MacroSettings.CreateDefault();
+        _vortexView.LoadSettings(_settings.Vortex);
+        SaveSettings();
+        AppendLog("Vortex settings reset to defaults.");
     }
 
-    private static Label CreateHotkeyLabel(string text) => UiTheme.CreateFieldLabel(text);
-
-    private TextBox CreateHotkeyBox(HotkeyChord chord)
+    private async Task StartVortexAsync()
     {
-        TextBox box = UiTheme.CreateHotkeyBox();
-        box.Text = FormatHotkey(chord);
-        box.Tag = chord;
-        box.Click += (_, _) => BeginHotkeyCapture(box);
-        box.KeyDown += HotkeyBoxOnKeyDown;
-        return box;
-    }
-
-    private Button CreateActionButton(string label, Color backColor, Func<HotkeyChord> hotkeyProvider, Action action)
-    {
-        Button button = UiTheme.CreateActionButton(FormatButtonLabel(label, hotkeyProvider()), backColor, (_, _) => action());
-        TrackButtonHotkey(button, label, hotkeyProvider);
-        return button;
-    }
-
-    private void TrackButtonHotkey(Button button, string baseLabel, Func<HotkeyChord> hotkeyProvider)
-    {
-        _buttonBaseLabels[button] = baseLabel;
-        _buttonHotkeyProviders[button] = hotkeyProvider;
-    }
-
-    private void RefreshButtonHotkeyLabel(Button button)
-    {
-        if (!_buttonBaseLabels.TryGetValue(button, out string? baseLabel) ||
-            !_buttonHotkeyProviders.TryGetValue(button, out Func<HotkeyChord>? hotkeyProvider))
+        if (_vortexCts != null || !_session.TryBegin(MacroSessionKind.Vortex))
         {
-            return;
-        }
-
-        bool isNav = _navButtons.Values.Contains(button);
-        button.Text = isNav
-            ? FormatNavButtonLabel(baseLabel, hotkeyProvider())
-            : FormatButtonLabel(baseLabel, hotkeyProvider());
-    }
-
-    private void RefreshAllButtonHotkeyLabels()
-    {
-        foreach (Button button in _buttonBaseLabels.Keys)
-        {
-            RefreshButtonHotkeyLabel(button);
-        }
-    }
-
-    private static string FormatButtonLabel(string baseLabel, HotkeyChord chord) =>
-        chord.IsValid ? $"{baseLabel} ({FormatHotkey(chord)})" : baseLabel;
-
-    private static string FormatNavButtonLabel(string baseLabel, HotkeyChord chord) =>
-        chord.IsValid ? $"{baseLabel}\n{FormatHotkey(chord)}" : baseLabel;
-
-    private void BeginHotkeyCapture(TextBox box)
-    {
-        _activeHotkeyCapture = box;
-        box.Text = "Press a key...";
-        box.Focus();
-    }
-
-    private void HotkeyBoxOnKeyDown(object? sender, KeyEventArgs e)
-    {
-        if (sender is not TextBox box || _activeHotkeyCapture != box)
-        {
-            return;
-        }
-
-        e.SuppressKeyPress = true;
-        if (e.KeyCode == Keys.Escape)
-        {
-            box.Text = FormatHotkey(box.Tag as HotkeyChord ?? new HotkeyChord());
-            _activeHotkeyCapture = null;
-            return;
-        }
-
-        if (e.KeyCode is Keys.ShiftKey or Keys.ControlKey or Keys.Menu)
-        {
-            return;
-        }
-
-        uint modifiers = 0;
-        if (e.Control)
-        {
-            modifiers |= NativeMethods.ModControl;
-        }
-
-        if (e.Alt)
-        {
-            modifiers |= NativeMethods.ModAlt;
-        }
-
-        if (e.Shift)
-        {
-            modifiers |= NativeMethods.ModShift;
-        }
-
-        var chord = new HotkeyChord
-        {
-            Modifiers = modifiers,
-            VirtualKey = (int)e.KeyCode
-        };
-        box.Tag = chord;
-        box.Text = FormatHotkey(chord);
-        _activeHotkeyCapture = null;
-    }
-
-    private async void StartVortex()
-    {
-        if (_vortexCts != null)
-        {
+            AppendLog("Another macro is already running.");
             return;
         }
 
         ApplySettingsFromInputs();
         SaveSettings();
         _vortexCts = new CancellationTokenSource();
-        SetVortexRunningState(true);
+        _vortexView.SetRunningState(true);
 
         try
         {
@@ -626,32 +380,27 @@ internal sealed class MainForm : Form
         {
             _vortexCts?.Dispose();
             _vortexCts = null;
-            SetVortexRunningState(false);
+            _session.End(MacroSessionKind.Vortex);
+            _vortexView.SetRunningState(false);
         }
     }
 
-    private async void StartAutoClicker()
+    private async Task StartAutoClickerAsync()
     {
-        if (_autoClickerCts != null)
+        if (_autoClickerCts != null || !_session.TryBegin(MacroSessionKind.AutoClicker))
         {
+            AppendLog("Another macro is already running.");
             return;
         }
 
         ApplySettingsFromInputs();
         SaveSettings();
         _autoClickerCts = new CancellationTokenSource();
-        _autoStartButton.Enabled = false;
-        _autoStopButton.Enabled = true;
+        _autoClickerView.SetRunningState(true);
 
         try
         {
-            bool rightClick = string.Equals(_autoClickTypeInput.SelectedItem?.ToString(), "Right", StringComparison.OrdinalIgnoreCase);
-            await _engine.RunAutoClickerAsync(
-                (int)_autoIntervalInput.Value,
-                (int)_autoClicksInput.Value,
-                rightClick,
-                (int)_autoStartDelayInput.Value,
-                _autoClickerCts.Token);
+            await _engine.RunAutoClickerAsync(_settings.AutoClicker, _autoClickerCts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -661,8 +410,8 @@ internal sealed class MainForm : Form
         {
             _autoClickerCts?.Dispose();
             _autoClickerCts = null;
-            _autoStartButton.Enabled = true;
-            _autoStopButton.Enabled = false;
+            _session.End(MacroSessionKind.AutoClicker);
+            _autoClickerView.SetRunningState(false);
         }
     }
 
@@ -670,29 +419,35 @@ internal sealed class MainForm : Form
     {
         if (_recorder.IsRecording)
         {
-            RecordedMacro macro = _recorder.StopRecording(_macroNameInput.Text);
-            _buttonBaseLabels[_recordToggleButton] = "Start Recording";
-            _recordToggleButton.BackColor = UiTheme.Danger;
-            RefreshButtonHotkeyLabel(_recordToggleButton);
+            RecordedMacro macro = _recorder.StopRecording(_recorderView.MacroName);
+            _recorderView.SetRecordingState(false);
+            _hotkeyButtons.SetBaseLabel(_recorderView.RecordToggleButton, "Start Recording");
+            _hotkeyButtons.Refresh(_recorderView.RecordToggleButton);
             AppendLog($"Saved recording \"{macro.Name}\" with {macro.Events.Count} events.");
             _recorder.LoadEvents(macro.Events);
             return;
         }
 
-        ApplySettingsFromInputs();
-        IEnumerable<int> suppressed = new[]
+        if (_session.Active != MacroSessionKind.None)
         {
+            AppendLog("Stop the running macro before recording.");
+            return;
+        }
+
+        ApplySettingsFromInputs();
+        int[] suppressed =
+        [
             _settings.Hotkeys.Start.VirtualKey,
             _settings.Hotkeys.Stop.VirtualKey,
             _settings.Hotkeys.Play.VirtualKey
-        };
+        ];
         _recorder.StartRecording(suppressed);
-        _buttonBaseLabels[_recordToggleButton] = "Stop Recording";
-        _recordToggleButton.BackColor = UiTheme.Success;
-        RefreshButtonHotkeyLabel(_recordToggleButton);
+        _recorderView.SetRecordingState(true);
+        _hotkeyButtons.SetBaseLabel(_recorderView.RecordToggleButton, "Stop Recording");
+        _hotkeyButtons.Refresh(_recorderView.RecordToggleButton);
     }
 
-    private async void PlayRecordedMacro()
+    private async Task PlayRecordedMacroAsync()
     {
         if (_playbackCts != null || _recorder.Events.Count == 0)
         {
@@ -704,16 +459,26 @@ internal sealed class MainForm : Form
             return;
         }
 
+        if (!_session.TryBegin(MacroSessionKind.Playback))
+        {
+            AppendLog("Another macro is already running.");
+            return;
+        }
+
         _playbackCts = new CancellationTokenSource();
+        ApplySettingsFromInputs();
         var macro = new RecordedMacro
         {
-            Name = _macroNameInput.Text,
-            Events = _recorder.Events.ToList()
+            Name = _recorderView.MacroName,
+            Events = _recorder.Events.ToList(),
+            RecordedScreenWidth = MacroEngine.GetPrimaryScreenSize().Width,
+            RecordedScreenHeight = MacroEngine.GetPrimaryScreenSize().Height,
+            UseRelativeCoordinates = true
         };
 
         try
         {
-            await _engine.RunRecordedMacroAsync(macro, _playbackCts.Token);
+            await _engine.RunRecordedMacroAsync(macro, _settings.Recorder, _playbackCts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -723,12 +488,92 @@ internal sealed class MainForm : Form
         {
             _playbackCts?.Dispose();
             _playbackCts = null;
+            _session.End(MacroSessionKind.Playback);
         }
     }
 
     private void StopVortex() => _vortexCts?.Cancel();
     private void StopAutoClicker() => _autoClickerCts?.Cancel();
     private void StopPlayback() => _playbackCts?.Cancel();
+    private void StopPiano() => _pianoCts?.Cancel();
+
+    private async Task StartPianoAsync()
+    {
+        if (_pianoCts != null)
+        {
+            return;
+        }
+
+        if (_pianoView.LoadedSong == null)
+        {
+            AppendLog("Select a .txt song file first.");
+            return;
+        }
+
+        if (!_session.TryBegin(MacroSessionKind.Piano))
+        {
+            AppendLog("Another macro is already running.");
+            return;
+        }
+
+        ApplySettingsFromInputs();
+        SaveSettings();
+        _pianoCts = new CancellationTokenSource();
+        _pianoView.SetRunningState(true);
+        PianoPlayerSettings playbackSettings = _pianoView.BuildPlaybackSettings();
+
+        try
+        {
+            await PianoPlayer.PlayAsync(
+                _pianoView.LoadedSong,
+                playbackSettings,
+                message => _pianoView.ReportStatus(message),
+                _pianoCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            AppendLog("Piano playback stopped.");
+        }
+        finally
+        {
+            PianoPlayer.ReleaseAllKeys(playbackSettings.Lowercase);
+            _pianoCts?.Dispose();
+            _pianoCts = null;
+            _session.End(MacroSessionKind.Piano);
+            _pianoView.SetRunningState(false);
+        }
+    }
+
+    private async Task PickCoordinateAsync()
+    {
+        if (_isPickingCoordinate)
+        {
+            return;
+        }
+
+        _isPickingCoordinate = true;
+        AppendLog("Click anywhere on screen to pick a coordinate (ESC cancels).");
+        WindowState = FormWindowState.Minimized;
+
+        try
+        {
+            (int X, int Y)? point = await _coordinatePicker.PickAsync();
+            if (point.HasValue)
+            {
+                _vortexView.ApplyPickedCoordinate(point.Value.X, point.Value.Y);
+            }
+            else
+            {
+                _vortexView.CancelPick();
+                AppendLog("Coordinate pick cancelled.");
+            }
+        }
+        finally
+        {
+            _isPickingCoordinate = false;
+            ShowFromTray();
+        }
+    }
 
     private void ImportMacro()
     {
@@ -744,9 +589,9 @@ internal sealed class MainForm : Form
         }
 
         RecordedMacro macro = RecordedMacro.Load(dialog.FileName);
-        _macroNameInput.Text = macro.Name;
+        _recorderView.MacroName = macro.Name;
         _recorder.LoadEvents(macro.Events);
-        AppendLog($"Imported macro \"{macro.Name}\" from {dialog.FileName}.");
+        AppendLog($"Imported macro \"{macro.Name}\".");
     }
 
     private void ExportMacro()
@@ -760,7 +605,7 @@ internal sealed class MainForm : Form
         using var dialog = new SaveFileDialog
         {
             Filter = "Macro JSON (*.json)|*.json",
-            FileName = $"{_macroNameInput.Text}.json",
+            FileName = $"{_recorderView.MacroName}.json",
             Title = "Export recorded macro"
         };
 
@@ -769,72 +614,101 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var macro = new RecordedMacro
+        new RecordedMacro
         {
-            Name = _macroNameInput.Text,
+            Name = _recorderView.MacroName,
             Events = _recorder.Events.ToList()
-        };
-        macro.Save(dialog.FileName);
+        }.Save(dialog.FileName);
         AppendLog($"Exported macro to {dialog.FileName}.");
     }
 
-    private void SaveSettings()
+    private void SaveMacroToLibrary()
     {
+        if (_recorder.Events.Count == 0)
+        {
+            AppendLog("Nothing to save to library.");
+            return;
+        }
+
+        var macro = new RecordedMacro
+        {
+            Name = _recorderView.MacroName,
+            Events = _recorder.Events.ToList(),
+            RecordedScreenWidth = MacroEngine.GetPrimaryScreenSize().Width,
+            RecordedScreenHeight = MacroEngine.GetPrimaryScreenSize().Height,
+            UseRelativeCoordinates = true
+        };
+        _macroLibrary.Save(macro);
+        _recorderView.RefreshLibrary(_macroLibrary.ListMacroNames(), macro.Name);
+        AppendLog($"Saved \"{macro.Name}\" to macro library.");
+    }
+
+    private void LoadMacroFromLibrary()
+    {
+        string? name = _recorderView.SelectedLibraryMacro;
+        if (string.IsNullOrWhiteSpace(name) || !_macroLibrary.Exists(name))
+        {
+            AppendLog("Select a macro from the library first.");
+            return;
+        }
+
+        RecordedMacro macro = _macroLibrary.Load(name);
+        _recorderView.MacroName = macro.Name;
+        _recorder.LoadEvents(macro.Events);
+        AppendLog($"Loaded \"{macro.Name}\" from library.");
+    }
+
+    private void DeleteMacroFromLibrary()
+    {
+        string? name = _recorderView.SelectedLibraryMacro;
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return;
+        }
+
+        _macroLibrary.Delete(name);
+        _recorderView.RefreshLibrary(_macroLibrary.ListMacroNames());
+        AppendLog($"Deleted \"{name}\" from library.");
+    }
+
+    private void ExportAllSettings()
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Filter = "JSON (*.json)|*.json",
+            FileName = "gasvar-macro-settings.json",
+            Title = "Export all settings"
+        };
+
+        if (dialog.ShowDialog() != DialogResult.OK)
+        {
+            return;
+        }
+
         ApplySettingsFromInputs();
-        _settings.Save(_settingsPath);
+        AppSettings.ExportAll(dialog.FileName, _settings);
+        AppendLog($"Exported all settings to {dialog.FileName}.");
+    }
+
+    private void ImportAllSettings()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Filter = "JSON (*.json)|*.json",
+            Title = "Import all settings"
+        };
+
+        if (dialog.ShowDialog() != DialogResult.OK)
+        {
+            return;
+        }
+
+        _settings = AppSettings.ImportAll(dialog.FileName, AppendLog);
+        LoadAllSettings();
         RegisterHotkeys();
-        AppendLog("Settings saved.");
-    }
-
-    private void ResetVortexDefaults()
-    {
-        _settings.Vortex = MacroSettings.CreateDefault();
-        LoadVortexSettingsIntoInputs();
+        ApplyBehaviorSettings();
         SaveSettings();
-        AppendLog("Vortex settings reset to defaults.");
-    }
-
-    private void ApplySettingsFromInputs()
-    {
-        foreach ((string propertyName, NumericUpDown input) in _vortexSettingInputs)
-        {
-            PropertyInfo? property = typeof(MacroSettings).GetProperty(propertyName);
-            property?.SetValue(_settings.Vortex, (int)input.Value);
-        }
-
-        _settings.AutoClicker.IntervalMs = (int)_autoIntervalInput.Value;
-        _settings.AutoClicker.ClickCount = (int)_autoClicksInput.Value;
-        _settings.AutoClicker.StartDelayMs = (int)_autoStartDelayInput.Value;
-        _settings.AutoClicker.ClickType = _autoClickTypeInput.SelectedItem?.ToString() ?? "Left";
-
-        _settings.Hotkeys.Start = GetHotkeyValue(_startHotkeyInput);
-        _settings.Hotkeys.Stop = GetHotkeyValue(_stopHotkeyInput);
-        _settings.Hotkeys.Play = GetHotkeyValue(_playHotkeyInput);
-    }
-
-    private void LoadSettingsIntoInputs()
-    {
-        LoadVortexSettingsIntoInputs();
-        _autoIntervalInput.Value = Math.Min(_autoIntervalInput.Maximum, Math.Max(_autoIntervalInput.Minimum, _settings.AutoClicker.IntervalMs));
-        _autoClicksInput.Value = Math.Min(_autoClicksInput.Maximum, Math.Max(_autoClicksInput.Minimum, _settings.AutoClicker.ClickCount));
-        _autoStartDelayInput.Value = Math.Min(_autoStartDelayInput.Maximum, Math.Max(_autoStartDelayInput.Minimum, _settings.AutoClicker.StartDelayMs));
-        _autoClickTypeInput.SelectedItem = _settings.AutoClicker.ClickType;
-
-        SetHotkeyBox(_startHotkeyInput, _settings.Hotkeys.Start);
-        SetHotkeyBox(_stopHotkeyInput, _settings.Hotkeys.Stop);
-        SetHotkeyBox(_playHotkeyInput, _settings.Hotkeys.Play);
-    }
-
-    private void LoadVortexSettingsIntoInputs()
-    {
-        foreach ((string propertyName, NumericUpDown input) in _vortexSettingInputs)
-        {
-            PropertyInfo? property = typeof(MacroSettings).GetProperty(propertyName);
-            if (property?.GetValue(_settings.Vortex) is int value)
-            {
-                input.Value = Math.Min(input.Maximum, Math.Max(input.Minimum, value));
-            }
-        }
+        AppendLog("Imported all settings.");
     }
 
     private void RegisterHotkeys()
@@ -847,21 +721,38 @@ internal sealed class MainForm : Form
         _hotkeyService.Dispose();
         _hotkeyService = new GlobalHotkeyService(Handle);
 
-        RegisterHotkey(_settings.Hotkeys.NavVortex, () => ShowView(AppView.Vortex));
-        RegisterHotkey(_settings.Hotkeys.NavAutoClicker, () => ShowView(AppView.AutoClicker));
-        RegisterHotkey(_settings.Hotkeys.NavRecorder, () => ShowView(AppView.Recorder));
+        Register("Nav Vortex", HotkeyRestrictions.NavVortex, () => ShowView(AppView.Vortex));
+        Register("Nav AutoClicker", HotkeyRestrictions.NavAutoClicker, () => ShowView(AppView.AutoClicker));
+        Register("Nav Recorder", HotkeyRestrictions.NavRecorder, () => ShowView(AppView.Recorder));
+        Register("Nav Piano", HotkeyRestrictions.NavPiano, () => ShowView(AppView.Piano));
+        Register("Start", _settings.Hotkeys.Start, DispatchStart);
+        Register("Stop", _settings.Hotkeys.Stop, DispatchStop);
+        Register("Play", _settings.Hotkeys.Play, DispatchPlay);
+        Register("Pause", HotkeyChord.FromKey((Keys)_settings.Vortex.ToggleHotkeyVirtualKey), DispatchPause);
+        Register("Save", _settings.Hotkeys.Save, () => SaveSettings());
+        Register("Reset", _settings.Hotkeys.Reset, DispatchReset);
+        Register("Import", _settings.Hotkeys.Import, DispatchImport);
+        Register("Export", _settings.Hotkeys.Export, DispatchExport);
 
-        RegisterHotkey(_settings.Hotkeys.Start, DispatchStart);
-        RegisterHotkey(_settings.Hotkeys.Stop, DispatchStop);
-        RegisterHotkey(_settings.Hotkeys.Play, DispatchPlay);
-        RegisterHotkey(HotkeyChord.FromKey((Keys)_settings.Vortex.ToggleHotkeyVirtualKey), DispatchPause);
+        _hotkeyButtons.RefreshAll();
 
-        RegisterHotkey(_settings.Hotkeys.Save, DispatchSave);
-        RegisterHotkey(_settings.Hotkeys.Reset, DispatchReset);
-        RegisterHotkey(_settings.Hotkeys.Import, DispatchImport);
-        RegisterHotkey(_settings.Hotkeys.Export, DispatchExport);
+        if (_hotkeyService.Conflicts.Count > 0)
+        {
+            AppendLog("Hotkey conflicts: " + string.Join(" | ", _hotkeyService.Conflicts));
+        }
+    }
 
-        RefreshAllButtonHotkeyLabels();
+    private void Register(string owner, HotkeyChord chord, Action action)
+    {
+        if (_hotkeyService == null || !chord.IsValid)
+        {
+            return;
+        }
+
+        if (!_hotkeyService.Register(owner, chord, action))
+        {
+            AppendLog($"Could not register hotkey {HotkeyFormatting.Format(chord)} for {owner}.");
+        }
     }
 
     private void DispatchStart()
@@ -869,54 +760,34 @@ internal sealed class MainForm : Form
         switch (_currentView)
         {
             case AppView.Vortex:
-                StartVortex();
+                _ = RunSafe(StartVortexAsync);
                 break;
             case AppView.AutoClicker:
-                StartAutoClicker();
+                _ = RunSafe(StartAutoClickerAsync);
                 break;
             case AppView.Recorder when !_recorder.IsRecording:
                 ToggleRecording();
+                break;
+            case AppView.Piano:
+                _ = RunSafe(StartPianoAsync);
                 break;
         }
     }
 
     private void DispatchStop()
     {
-        if (_vortexCts != null)
-        {
-            StopVortex();
-            return;
-        }
-
-        if (_autoClickerCts != null)
-        {
-            StopAutoClicker();
-            return;
-        }
-
-        if (_playbackCts != null)
-        {
-            StopPlayback();
-            return;
-        }
-
-        if (_recorder.IsRecording)
-        {
-            ToggleRecording();
-            return;
-        }
+        if (_vortexCts != null) { StopVortex(); return; }
+        if (_autoClickerCts != null) { StopAutoClicker(); return; }
+        if (_playbackCts != null) { StopPlayback(); return; }
+        if (_pianoCts != null) { StopPiano(); return; }
+        if (_recorder.IsRecording) { ToggleRecording(); return; }
 
         switch (_currentView)
         {
-            case AppView.Vortex:
-                StopVortex();
-                break;
-            case AppView.AutoClicker:
-                StopAutoClicker();
-                break;
-            case AppView.Recorder:
-                StopPlayback();
-                break;
+            case AppView.Vortex: StopVortex(); break;
+            case AppView.AutoClicker: StopAutoClicker(); break;
+            case AppView.Recorder: StopPlayback(); break;
+            case AppView.Piano: StopPiano(); break;
         }
     }
 
@@ -924,7 +795,7 @@ internal sealed class MainForm : Form
     {
         if (_currentView == AppView.Recorder)
         {
-            PlayRecordedMacro();
+            _ = RunSafe(PlayRecordedMacroAsync);
         }
     }
 
@@ -934,11 +805,6 @@ internal sealed class MainForm : Form
         {
             _engine.TogglePause();
         }
-    }
-
-    private void DispatchSave()
-    {
-        SaveSettings();
     }
 
     private void DispatchReset()
@@ -971,51 +837,88 @@ internal sealed class MainForm : Form
         }
     }
 
-    private void RegisterHotkey(HotkeyChord chord, Action action)
+    private void OnSessionStarted(object? sender, MacroSessionKind kind)
     {
-        if (_hotkeyService == null || !chord.IsValid)
+        if (!_settings.Behavior.ShowOverlay)
         {
             return;
         }
 
-        if (!_hotkeyService.Register(chord, action))
+        _overlay ??= new MacroOverlayForm();
+        _overlay.SetStatus($"{kind} running — ESC to stop");
+        if (!_overlay.Visible)
         {
-            AppendLog($"Could not register hotkey {FormatHotkey(chord)}.");
+            _overlay.Show();
         }
     }
 
-    private void SetVortexRunningState(bool running)
+    private void OnSessionEnded(object? sender, MacroSessionKind kind)
     {
-        _vortexStartButton.Enabled = !running;
-        _vortexPauseButton.Enabled = running;
-        _vortexStopButton.Enabled = running;
+        _overlay?.Hide();
     }
 
-    private void RefreshRecordedEventsList()
+    private void EnsureTray()
     {
-        if (InvokeRequired)
+        if (_tray != null)
         {
-            BeginInvoke(RefreshRecordedEventsList);
             return;
         }
 
-        _recordedEventsList.Items.Clear();
-        foreach (RecordedMacroEvent recordedEvent in _recorder.Events)
+        _tray = new TrayIconService(this);
+        _tray.ShowRequested += (_, _) => ShowFromTray();
+        _tray.ExitRequested += (_, _) =>
         {
-            _recordedEventsList.Items.Add(recordedEvent.Describe());
+            _reallyExit = true;
+            Close();
+        };
+    }
+
+    private void HideToTray()
+    {
+        EnsureTray();
+        Hide();
+        _tray?.ShowBalloon("Gasvar Macro is still running in the tray.");
+    }
+
+    private void ShowFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    private async Task RunSafe(Func<Task> action)
+    {
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Error: {ex.Message}");
         }
     }
 
     private void AppendLog(string message)
     {
+        if (IsDisposed || _logBox == null)
+        {
+            return;
+        }
+
         if (InvokeRequired)
         {
-            BeginInvoke(() => AppendLog(message));
+            if (IsHandleCreated)
+            {
+                BeginInvoke(() => AppendLog(message));
+            }
+
             return;
         }
 
         string timestamp = DateTime.Now.ToString("HH:mm:ss");
         _logBox.AppendText($"[{timestamp}] {message}{Environment.NewLine}");
+        _overlay?.SetStatus(message);
     }
 
     private void SetMousePosition(string position)
@@ -1027,74 +930,5 @@ internal sealed class MainForm : Form
         }
 
         _mousePositionLabel.Text = position;
-    }
-
-    private static HotkeyChord GetHotkeyValue(TextBox box) => box.Tag as HotkeyChord ?? new HotkeyChord();
-
-    private static void SetHotkeyBox(TextBox box, HotkeyChord chord)
-    {
-        box.Tag = chord;
-        box.Text = FormatHotkey(chord);
-    }
-
-    private static string FormatHotkey(HotkeyChord chord)
-    {
-        if (!chord.IsValid)
-        {
-            return "None";
-        }
-
-        var parts = new List<string>();
-        if ((chord.Modifiers & NativeMethods.ModControl) != 0)
-        {
-            parts.Add("Ctrl");
-        }
-
-        if ((chord.Modifiers & NativeMethods.ModAlt) != 0)
-        {
-            parts.Add("Alt");
-        }
-
-        if ((chord.Modifiers & NativeMethods.ModShift) != 0)
-        {
-            parts.Add("Shift");
-        }
-
-        parts.Add(chord.Key.ToString());
-        return string.Join("+", parts);
-    }
-
-    private static void AddConfigRow(TableLayoutPanel table, int row, string label, Control control)
-    {
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(UiTheme.CreateFieldLabel(label), 0, row);
-        table.Controls.Add(control, 1, row);
-    }
-
-    private void AddVortexSetting(TableLayoutPanel table, ref int row, string propertyName, string labelText, int minimum = -10000, int maximum = 10000)
-    {
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(UiTheme.CreateFieldLabel(labelText), 0, row);
-
-        NumericUpDown input = UiTheme.CreateNumericInput(minimum, maximum, 0);
-        _vortexSettingInputs[propertyName] = input;
-        table.Controls.Add(input, 1, row);
-        row++;
-    }
-
-    private static void AddSection(TableLayoutPanel table, ref int row, string title)
-    {
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        var label = new Label
-        {
-            Text = title,
-            Font = new Font("Segoe UI Semibold", 11F, FontStyle.Bold),
-            ForeColor = UiTheme.Text,
-            AutoSize = true,
-            Margin = new Padding(0, 16, 0, 8)
-        };
-        table.Controls.Add(label, 0, row);
-        table.SetColumnSpan(label, 2);
-        row++;
     }
 }

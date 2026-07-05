@@ -1,11 +1,45 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+
+
   <PropertyGroup>
+
     <OutputType>WinExe</OutputType>
+
     <TargetFramework>net8.0-windows</TargetFramework>
+
     <UseWindowsForms>true</UseWindowsForms>
+
     <ImplicitUsings>enable</ImplicitUsings>
+
     <Nullable>enable</Nullable>
+
+    <ApplicationIcon />
+
+    <AssemblyName>AutoClicker</AssemblyName>
+
+    <RootNamespace>AutoClicker</RootNamespace>
+
+    <Version>2.0.0</Version>
+
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+
+    <FileVersion>2.0.0.0</FileVersion>
+
+    <Product>Gasvar Macro</Product>
+
+    <Description>Macro automation tool with Vortex Nexus, AutoClicker, Recorder, and Piano Player.</Description>
+
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="AutoClicker.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="songs\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
+
+
